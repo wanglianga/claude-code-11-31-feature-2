@@ -1,0 +1,8 @@
+**/node_modules
+**/.npm-cache
+**/dist
+**/target
+**/*.log
+.git
+.idea
+.vscode

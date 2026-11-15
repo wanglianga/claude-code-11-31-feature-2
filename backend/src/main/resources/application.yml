@@ -1,0 +1,35 @@
+server:
+  port: 8080
+  servlet:
+    context-path: /api
+
+spring:
+  application:
+    name: repair-config-lineage
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://127.0.0.1:5432/ccdev}
+    username: ${DB_USER:ccdev}
+    password: ${DB_PASSWORD:ccdev}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      pool-name: mdm-pool
+  jackson:
+    time-zone: Asia/Shanghai
+    date-format: yyyy-MM-dd HH:mm:ss
+  sql:
+    init:
+      mode: never
+
+app:
+  security:
+    token-ttl-hours: 12
+  demo:
+    # 启动时自动建表/灌种子/重放样例；生产环境可关闭
+    auto-init: ${AUTO_INIT:true}
+    reset-on-start: ${RESET_ON_START:false}
+
+logging:
+  level:
+    com.mdm.platform: INFO
+    org.springframework.jdbc: WARN
