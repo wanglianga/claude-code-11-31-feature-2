@@ -138,3 +138,73 @@ INSERT INTO rule_constraint (id, rule_id, constraint_type, attribute_name, expec
  (5,3,'POWER','voltage','380V','EQ','spec.voltage'),
  (6,3,'DIMENSION','dimension','2U','EQ','spec.dimension');
 SELECT setval('rule_constraint_id_seq', 10);
+
+-- =====================================================================
+-- 8. 属性断言台账（编号 / 配对 / 剩余寿命 / 安装日期 / 规范号）
+--    验收抓手：
+--      编号变体      PP-MTR-0001 三来源写法不同，归一后一致 -> CONFIRMED 且原文全保留
+--      寿命冲突      ULTRASONIC 1200~1500h 与 VIBRATION 300~500h 不相交 -> CONFLICT，禁止平均
+--      单向撤销      配对断言撤销 B 侧 -> 整对不可确认，A 侧证据保留
+--      过期引用      PP-MTR-0018 安装日期报告超期 -> EXPIRED，且缺口传给剩余寿命
+--      主体冲突      PP-MTR-0018 规范号指向 100A/100B 且无改号凭证 -> CONFLICT
+--      改号凭证对照  PP-SDU-0001 规范号跨型号但有改号凭证 -> CONFIRMED
+-- =====================================================================
+INSERT INTO attribute_assertion
+ (id, assertion_no, subject_id, attribute_key, source_kind, source_priority, inspection_method,
+  raw_value, normalized_value, manufacturer_prefix, asserted_model_id, renumber_cert_no,
+  life_lower_hours, life_upper_hours, pair_peer_subject_id, report_date, valid_until,
+  source_contract_id, source_ref, payload_digest) VALUES
+ -- 编号变体：三种写法，前缀与分隔符不同，归一后同为 SN1
+ (1,'AA-SER-00001',50,'SERIAL_NUMBER','WORKSHOP',60,NULL,
+  'SN-0001','SN1',NULL,NULL,NULL,NULL,NULL,NULL,'2024-03-01T08:00:00Z','2026-12-31T00:00:00Z',3,'WS-2024-0301-A','sha256:aa-ser-1'),
+ (2,'AA-SER-00002',50,'SERIAL_NUMBER','QC',80,'ETCH_READ',
+  'SIEMENS-SN-0001','SN1','SIEMENS',NULL,NULL,NULL,NULL,NULL,'2024-04-01T09:00:00Z','2026-12-31T00:00:00Z',4,'QC-2024-0401-A','sha256:aa-ser-2'),
+ (3,'AA-SER-00003',50,'SERIAL_NUMBER','OUTSOURCE',40,'SUPPLIER_LABEL',
+  'SIE-SN-1','SN1','SIE',NULL,NULL,NULL,NULL,NULL,'2024-05-01T10:00:00Z','2026-12-31T00:00:00Z',2,'OS-2024-0501-A','sha256:aa-ser-3'),
+ -- 剩余寿命：两种检测方法区间不相交
+ (4,'AA-REM-00004',50,'REMAINING_LIFE','QC',80,'ULTRASONIC',
+  '1200-1500h','1200-1500H',NULL,NULL,NULL,1200.00,1500.00,NULL,'2024-06-01T09:00:00Z','2025-06-01T00:00:00Z',4,'QC-UT-2024-0601','sha256:aa-rem-1'),
+ (5,'AA-REM-00005',50,'REMAINING_LIFE','OUTSOURCE',55,'VIBRATION',
+  '300-500h','300-500H',NULL,NULL,NULL,300.00,500.00,NULL,'2024-06-10T09:00:00Z','2025-06-01T00:00:00Z',2,'OS-VIB-2024-0610','sha256:aa-rem-2'),
+ -- 配对：A/B 两侧证据齐全（初始状态可确认，初始化时撤销 B 侧）
+ (6,'AA-PAI-00006',50,'PAIRING','WORKSHOP',70,NULL,
+  'PAIR-MTR-0001-0018','PAIRMTR00010018',NULL,NULL,NULL,NULL,NULL,51,'2024-02-01T08:00:00Z','2026-12-31T00:00:00Z',3,'WS-PAIR-0001','sha256:aa-pai-1'),
+ -- 安装日期：报告超期（有效期早于分析日期 2024-12-01）
+ (7,'AA-INS-00007',50,'INSTALL_DATE','WORKSHOP',60,NULL,
+  '2024-02-01','2024-02-01',NULL,NULL,NULL,NULL,NULL,NULL,'2024-02-01T08:00:00Z','2026-12-31T00:00:00Z',3,'WS-INST-0001','sha256:aa-ins-1'),
+ (8,'AA-INS-00008',50,'INSTALL_DATE','QC',75,'DOC_REVIEW',
+  '2024-02-01','2024-02-01',NULL,NULL,NULL,NULL,NULL,NULL,'2024-02-05T08:00:00Z','2026-12-31T00:00:00Z',4,'QC-INST-0001','sha256:aa-ins-2'),
+ -- 主体冲突：同一规范号指向 100A / 100B 且无改号凭证
+ (9,'AA-CAT-00009',51,'CATALOG_NUMBER','WORKSHOP',60,NULL,
+  'DRW-MOTOR-100','DRWMOTOR100',NULL,30,NULL,NULL,NULL,NULL,'2024-05-01T08:00:00Z','2026-12-31T00:00:00Z',3,'WS-CAT-0018-A','sha256:aa-cat-1'),
+ (10,'AA-CAT-00010',51,'CATALOG_NUMBER','QC',80,'DOC_REVIEW',
+  'DRW-MOTOR-100-B','DRWMOTOR100B',NULL,31,NULL,NULL,NULL,NULL,'2024-05-02T08:00:00Z','2026-12-31T00:00:00Z',4,'QC-CAT-0018-B','sha256:aa-cat-2'),
+ -- 过期引用对照：PP-MTR-0018 安装日期仅有超期报告
+ (11,'AA-INS-00011',51,'INSTALL_DATE','OUTSOURCE',50,NULL,
+  '2024-07-01','2024-07-01',NULL,NULL,NULL,NULL,NULL,NULL,'2024-07-01T08:00:00Z','2024-10-01T00:00:00Z',2,'OS-INST-0018','sha256:aa-ins-3'),
+ -- 依赖缺口演示：剩余寿命区间本身完整，但安装日期超期 -> 缺口传播 -> UNKNOWN
+ (12,'AA-REM-00012',51,'REMAINING_LIFE','QC',80,'ULTRASONIC',
+  '800-900h','800-900H',NULL,NULL,NULL,800.00,900.00,NULL,'2024-07-10T09:00:00Z','2026-12-31T00:00:00Z',4,'QC-UT-2024-0710','sha256:aa-rem-3'),
+ (13,'AA-SER-00013',51,'SERIAL_NUMBER','QC',80,'ETCH_READ',
+  'SN-0018','SN18',NULL,NULL,NULL,NULL,NULL,NULL,'2024-05-01T09:00:00Z','2026-12-31T00:00:00Z',4,'QC-SER-0018','sha256:aa-ser-4'),
+ -- 改号凭证对照：PP-SDU-0001 规范号跨型号，但有改号凭证 -> CONFIRMED
+ (14,'AA-CAT-00014',52,'CATALOG_NUMBER','WORKSHOP',60,NULL,
+  'DRW-SDU-300','DRWSDU300',NULL,32,NULL,NULL,NULL,NULL,'2024-03-01T08:00:00Z','2026-12-31T00:00:00Z',3,'WS-CAT-0001','sha256:aa-cat-3'),
+ (15,'AA-CAT-00015',52,'CATALOG_NUMBER','QC',80,'DOC_REVIEW',
+  'DRW-MOTOR-100','DRWMOTOR100',NULL,34,'RN-2024-001',NULL,NULL,NULL,'2024-03-05T08:00:00Z','2026-12-31T00:00:00Z',4,'QC-CAT-0001','sha256:aa-cat-4'),
+ -- 规范号一致（单型号）：PP-MTR-0001 -> 100A，两来源一致 -> CONFIRMED
+ (16,'AA-CAT-00016',50,'CATALOG_NUMBER','WORKSHOP',60,NULL,
+  'DRW-MOTOR-100','DRWMOTOR100',NULL,30,NULL,NULL,NULL,NULL,'2024-03-01T08:00:00Z','2026-12-31T00:00:00Z',3,'WS-CAT-0001','sha256:aa-cat-5'),
+ (17,'AA-CAT-00017',50,'CATALOG_NUMBER','OUTSOURCE',45,'SUPPLIER_LABEL',
+  'SIE-DRW-MOTOR-100','DRWMOTOR100','SIE',30,NULL,NULL,NULL,NULL,'2024-04-15T08:00:00Z','2026-12-31T00:00:00Z',2,'OS-CAT-0001','sha256:aa-cat-6');
+SELECT setval('attribute_assertion_id_seq', 100);
+
+-- 配对两侧证据（A 指向实物本身，B 指向对侧实物）
+INSERT INTO pairing_evidence (assertion_id, side, subject_id, evidence_ref, payload_digest, recorded_by) VALUES
+ (6,'A',50,'WS-PAIR-0001-A','sha256:pe-6-a','admin'),
+ (6,'B',51,'WS-PAIR-0001-B','sha256:pe-6-b','admin');
+SELECT setval('pairing_evidence_id_seq', 100);
+
+-- 属性依赖：剩余寿命依赖安装日期（证据缺口沿此边传播）
+INSERT INTO attribute_dependency (attribute_key, depends_on_key, rationale) VALUES
+ ('REMAINING_LIFE','INSTALL_DATE','剩余寿命按安装日期起算，安装日期未确认时不得给出可发布寿命结论');

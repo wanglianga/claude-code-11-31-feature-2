@@ -46,7 +46,10 @@ const scenarios = [
     route: '/impact' },
   { title: 'E. 两条约束联动', tag: '最小证据链', type: 'success',
     desc: '电源 380V + 协议 EtherCAT（或 + 尺寸 2U）同时满足才 PASS；502 因尺寸 3U≠2U 判 FAIL，逐项约束进入证据链。',
-    route: '/compatibility' }
+    route: '/compatibility' },
+  { title: 'F. 属性断言双模式求值', tag: '确认/冲突/过期/未知', type: 'danger',
+    desc: '编号变体归一致、检测方法区间不相交禁平均、配对单向撤销整对不可确认、超期报告不支撑确认、缺口沿依赖传播；来源优先级与断言时态两模式并存。',
+    route: '/attributes' }
 ]
 
 onMounted(async () => {

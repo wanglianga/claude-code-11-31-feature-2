@@ -378,3 +378,112 @@ CREATE TABLE IF NOT EXISTS release_audit_log (
     reason              TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ---------------------------------------------------------------------
+-- 12. 属性断言台账：编号 / 配对 / 剩余寿命（追加式，不覆盖任何来源原文）
+--     - 保留原始编号、制造商前缀、检测方法、报告日期、有效期
+--     - 报告超期后不能继续支撑"确认"结论
+--     - 配对证据 A/B 两侧分别留痕，可单向撤销
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS attribute_assertion (
+    id                  BIGSERIAL PRIMARY KEY,
+    assertion_no        VARCHAR(64) NOT NULL UNIQUE,
+    subject_id          BIGINT NOT NULL REFERENCES master_entity(id),   -- 实物序列号
+    attribute_key       VARCHAR(32) NOT NULL
+                        CHECK (attribute_key IN
+                        ('SERIAL_NUMBER','CATALOG_NUMBER','PAIRING','REMAINING_LIFE','INSTALL_DATE')),
+    source_kind         VARCHAR(16) NOT NULL CHECK (source_kind IN ('WORKSHOP','QC','OUTSOURCE')),
+    source_priority     INT NOT NULL DEFAULT 50,               -- 来源优先级（来源优先级模式选当前断言用）
+    inspection_method   VARCHAR(48),                            -- 检测方法（寿命/编号；方法不同不可混算）
+    raw_value           VARCHAR(256) NOT NULL,                  -- 原始编号/原始值（原文保留）
+    normalized_value    VARCHAR(256) NOT NULL,                  -- 归一化值（仅用于比对，不覆盖原文）
+    manufacturer_prefix VARCHAR(64),                            -- 制造商前缀
+    asserted_model_id   BIGINT REFERENCES master_entity(id),    -- 规范号指向的部件型号
+    renumber_cert_no    VARCHAR(64),                            -- 改号凭证号（缺凭证则主体冲突不可消解）
+    life_lower_hours    NUMERIC(12,2),                          -- 剩余寿命区间下界
+    life_upper_hours    NUMERIC(12,2),                          -- 剩余寿命区间上界
+    pair_peer_subject_id BIGINT REFERENCES master_entity(id),   -- 配对的对侧实物
+    report_date         TIMESTAMPTZ NOT NULL,                   -- 报告日期
+    valid_until         TIMESTAMPTZ,                            -- 有效期（超过后不能支撑确认）
+    received_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_contract_id  BIGINT REFERENCES ingestion_contract(id),
+    source_ref          VARCHAR(256),
+    payload_digest      VARCHAR(128),
+    status              VARCHAR(16) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','REVOKED')),
+    revoked_at          TIMESTAMPTZ,
+    revoked_side        VARCHAR(8),                             -- A / B / ALL：单向撤销保留对侧证据
+    revoke_reason       TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_attr_assert_subject
+    ON attribute_assertion (subject_id, attribute_key, report_date);
+CREATE INDEX IF NOT EXISTS idx_attr_assert_valid
+    ON attribute_assertion (attribute_key, valid_until);
+
+-- 配对两侧证据（A/B 两侧独立留痕，撤销一侧后整对不可确认）
+CREATE TABLE IF NOT EXISTS pairing_evidence (
+    id              BIGSERIAL PRIMARY KEY,
+    assertion_id    BIGINT NOT NULL REFERENCES attribute_assertion(id) ON DELETE CASCADE,
+    side            CHAR(1) NOT NULL CHECK (side IN ('A','B')),
+    subject_id      BIGINT NOT NULL REFERENCES master_entity(id),
+    evidence_ref    VARCHAR(256) NOT NULL,
+    payload_digest  VARCHAR(128),
+    recorded_by     VARCHAR(64),
+    revoked_at      TIMESTAMPTZ,
+    revoke_reason   TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (assertion_id, side)
+);
+
+-- 属性依赖：证据缺口沿依赖边传播（如寿命依赖安装日期）
+CREATE TABLE IF NOT EXISTS attribute_dependency (
+    id              BIGSERIAL PRIMARY KEY,
+    attribute_key   VARCHAR(32) NOT NULL,
+    depends_on_key  VARCHAR(32) NOT NULL,
+    rationale       VARCHAR(256) NOT NULL,
+    UNIQUE (attribute_key, depends_on_key)
+);
+
+-- 来源优先级模式的选择快照：读取快，但需额外快照解释"历史为什么选它"
+CREATE TABLE IF NOT EXISTS attribute_mode_snapshot (
+    id                  BIGSERIAL PRIMARY KEY,
+    snapshot_no         VARCHAR(64) NOT NULL UNIQUE,
+    mode                VARCHAR(24) NOT NULL CHECK (mode IN ('SOURCE_PRIORITY','TEMPORAL')),
+    subject_id          BIGINT NOT NULL REFERENCES master_entity(id),
+    analysis_date       TIMESTAMPTZ NOT NULL,
+    selections          JSONB NOT NULL DEFAULT '[]'::jsonb,     -- 每属性：选中断言 + 被列为异常的断言
+    selection_digest    VARCHAR(128),
+    created_by          VARCHAR(64),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_attr_snap ON attribute_mode_snapshot (subject_id, mode, analysis_date);
+
+-- 属性求值台账：按分析日期/模式留档，历史选择可重演
+CREATE TABLE IF NOT EXISTS attribute_evaluation (
+    id                  BIGSERIAL PRIMARY KEY,
+    evaluation_no       VARCHAR(64) NOT NULL UNIQUE,
+    mode                VARCHAR(24) NOT NULL CHECK (mode IN ('SOURCE_PRIORITY','TEMPORAL')),
+    subject_id          BIGINT NOT NULL REFERENCES master_entity(id),
+    attribute_key       VARCHAR(32) NOT NULL,
+    analysis_date       TIMESTAMPTZ NOT NULL,
+    status              VARCHAR(16) NOT NULL
+                        CHECK (status IN ('CONFIRMED','CONFLICT','EXPIRED','UNKNOWN')),
+    chosen_assertion_id BIGINT REFERENCES attribute_assertion(id),
+    exceptions          JSONB NOT NULL DEFAULT '[]'::jsonb,     -- 来源优先级：未选中的其他断言及原因
+    evidence_gaps       JSONB NOT NULL DEFAULT '[]'::jsonb,     -- 依赖属性证据缺口
+    source_path         JSONB NOT NULL DEFAULT '[]'::jsonb,     -- 来源路径（原文/前缀/方法/报告日期/有效期）
+    detail              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    mode_snapshot_id    BIGINT REFERENCES attribute_mode_snapshot(id),
+    created_by          VARCHAR(64),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_attr_eval
+    ON attribute_evaluation (subject_id, attribute_key, analysis_date, mode);
+
+-- 扩展质量事件类型：属性冲突 / 过期 / 缺口 / 配对撤销
+ALTER TABLE quality_event DROP CONSTRAINT IF EXISTS quality_event_event_type_check;
+ALTER TABLE quality_event ADD CONSTRAINT quality_event_event_type_check
+    CHECK (event_type IN
+    ('CONFLICT_BLOCK','ENTITY_FREEZE','RULE_RETIRE','FACT_CORRECTION',
+     'LATE_VOUCHER','SNAPSHOT_REVIEW','RELEASE_GATE_BLOCK',
+     'ATTRIBUTE_CONFLICT','ATTRIBUTE_EXPIRED','ATTRIBUTE_GAP','PAIRING_REVOKE'));

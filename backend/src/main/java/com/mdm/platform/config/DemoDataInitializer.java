@@ -1,6 +1,7 @@
 package com.mdm.platform.config;
 
 import com.mdm.platform.repository.JdbcSupport;
+import com.mdm.platform.service.AttributeAssertionService;
 import com.mdm.platform.service.CompatibilityService;
 import com.mdm.platform.service.ImpactAnalysisService;
 import com.mdm.platform.service.IngestionService;
@@ -39,6 +40,7 @@ public class DemoDataInitializer implements ApplicationRunner {
     private final ReleaseGateService releaseGateService;
     private final IngestionService ingestionService;
     private final ImpactAnalysisService impactAnalysisService;
+    private final AttributeAssertionService attributeService;
 
     @Value("${app.demo.auto-init:true}")
     private boolean autoInit;
@@ -51,7 +53,8 @@ public class DemoDataInitializer implements ApplicationRunner {
                                CompatibilityService compatibilityService,
                                ReleaseGateService releaseGateService,
                                IngestionService ingestionService,
-                               ImpactAnalysisService impactAnalysisService) {
+                               ImpactAnalysisService impactAnalysisService,
+                               AttributeAssertionService attributeService) {
         this.dataSource = dataSource;
         this.db = db;
         this.snapshotService = snapshotService;
@@ -59,6 +62,7 @@ public class DemoDataInitializer implements ApplicationRunner {
         this.releaseGateService = releaseGateService;
         this.ingestionService = ingestionService;
         this.impactAnalysisService = impactAnalysisService;
+        this.attributeService = attributeService;
     }
 
     @Override
@@ -93,7 +97,8 @@ public class DemoDataInitializer implements ApplicationRunner {
                 "conflict_fact","snapshot_position","config_snapshot","rule_constraint","substitution_rule",
                 "inspection_record","factory_record","install_event","drawing_revision","drawing",
                 "entity_alias_candidate","master_entity","ingestion_contract_version","ingestion_contract",
-                "app_user"};
+                "attribute_evaluation","attribute_mode_snapshot","attribute_dependency",
+                "pairing_evidence","attribute_assertion","app_user"};
         try (var st = conn.createStatement()) {
             for (String t : tables) {
                 st.execute("TRUNCATE TABLE " + t + " RESTART IDENTITY CASCADE");
@@ -194,9 +199,86 @@ public class DemoDataInitializer implements ApplicationRunner {
         // 图号修订影响分析（场景A 配套）
         impactAnalysisService.analyzeDrawingChange(2L);
 
+        replayAttributeScenarios();
+
         log.info("==== 五大场景重放完成，共生成快照 {} 个，兼容事实 {} 条，质量事件 {} 条 ====",
                 db.count("SELECT count(*) FROM config_snapshot"),
                 db.count("SELECT count(*) FROM compatibility_fact"),
                 db.count("SELECT count(*) FROM quality_event"));
+    }
+
+    /**
+     * 属性断言场景重放：编号变体 / 寿命冲突 / 单向撤销 / 过期引用（含缺口传播）/ 规范号主体冲突。
+     * 每条结论均通过真实求值服务产生并留档，接口可直接回放。
+     */
+    private void replayAttributeScenarios() {
+        log.info("==== 开始重放属性断言场景（编号变体/单向撤销/寿命冲突/过期引用）====");
+        final long PP_MTR_0001 = 50, PP_MTR_0018 = 51, PP_SDU_0001 = 52;
+        OffsetDateTime analyzeAt = OffsetDateTime.parse("2024-12-01T00:00:00Z");
+
+        // 编号变体：三来源不同写法，归一一致 -> CONFIRMED，原文保留
+        var serial = attributeService.evaluate(new AttributeAssertionService.EvaluationRequest(
+                PP_MTR_0001, "SERIAL_NUMBER", analyzeAt, "TEMPORAL"));
+        log.info("属性-编号变体: PP-MTR-0001 SERIAL_NUMBER -> {}", statusOf(serial));
+
+        // 寿命冲突：ULTRASONIC 1200~1500h 与 VIBRATION 300~500h 不相交 -> CONFLICT，不平均
+        var life = attributeService.evaluate(new AttributeAssertionService.EvaluationRequest(
+                PP_MTR_0001, "REMAINING_LIFE", analyzeAt, "TEMPORAL"));
+        log.info("属性-寿命冲突: PP-MTR-0001 REMAINING_LIFE -> {}", statusOf(life));
+
+        // 配对：先以两侧证据求值（CONFIRMED），再撤销 B 侧 -> 整对不可确认，A 侧证据保留
+        var pairBefore = attributeService.evaluate(new AttributeAssertionService.EvaluationRequest(
+                PP_MTR_0001, "PAIRING", analyzeAt, "TEMPORAL"));
+        log.info("属性-配对(撤销前): {}", statusOf(pairBefore));
+        Long pairAssertionId = db.queryOne(
+                "SELECT id FROM attribute_assertion WHERE subject_id=? AND attribute_key='PAIRING' " +
+                "ORDER BY id LIMIT 1", PP_MTR_0001) == null ? null
+                : ((Number) db.queryOne(
+                "SELECT id FROM attribute_assertion WHERE subject_id=? AND attribute_key='PAIRING' " +
+                "ORDER BY id LIMIT 1", PP_MTR_0001).get("id")).longValue();
+        if (pairAssertionId != null) {
+            attributeService.revokeAssertion(pairAssertionId, "B",
+                    "外协资料撤回对侧签收凭证，单向撤销");
+            var pairAfter = attributeService.evaluate(new AttributeAssertionService.EvaluationRequest(
+                    PP_MTR_0001, "PAIRING", analyzeAt, "TEMPORAL"));
+            log.info("属性-配对(撤销B侧后): {}（A 侧证据保留）", statusOf(pairAfter));
+        }
+
+        // 过期引用：PP-MTR-0018 安装日期仅超期报告 -> EXPIRED；寿命因依赖缺口 -> UNKNOWN
+        var legacyInstall = attributeService.evaluate(new AttributeAssertionService.EvaluationRequest(
+                PP_MTR_0018, "INSTALL_DATE", OffsetDateTime.parse("2024-12-01T00:00:00Z"), "TEMPORAL"));
+        var legacyLife = attributeService.evaluate(new AttributeAssertionService.EvaluationRequest(
+                PP_MTR_0018, "REMAINING_LIFE", OffsetDateTime.parse("2024-12-01T00:00:00Z"), "TEMPORAL"));
+        log.info("属性-过期引用: PP-MTR-0018 INSTALL_DATE -> {}；REMAINING_LIFE 缺口传播 -> {}",
+                statusOf(legacyInstall), statusOf(legacyLife));
+
+        // 规范号主体冲突：同一规范号指向 100A/100B 且无改号凭证 -> CONFLICT
+        var catalog = attributeService.evaluate(new AttributeAssertionService.EvaluationRequest(
+                PP_MTR_0018, "CATALOG_NUMBER", analyzeAt, "TEMPORAL"));
+        log.info("属性-主体冲突: PP-MTR-0018 CATALOG_NUMBER -> {}", statusOf(catalog));
+
+        // 改号凭证对照：跨型号但有改号凭证 -> CONFIRMED
+        var renumbered = attributeService.evaluate(new AttributeAssertionService.EvaluationRequest(
+                PP_SDU_0001, "CATALOG_NUMBER", analyzeAt, "TEMPORAL"));
+        log.info("属性-改号凭证: PP-SDU-0001 CATALOG_NUMBER -> {}", statusOf(renumbered));
+
+        // 来源优先级模式：每个属性选一项当前断言、其余列异常，并落选择快照解释历史选择
+        var priority = attributeService.evaluate(new AttributeAssertionService.EvaluationRequest(
+                PP_MTR_0001, null, analyzeAt, "SOURCE_PRIORITY"));
+        log.info("属性-来源优先级模式: PP-MTR-0001 全属性求值快照 {} 完成",
+                priority.get("modeSnapshotNo"));
+
+        log.info("==== 属性断言场景重放完成，求值台账 {} 条，选择快照 {} 份 ====",
+                db.count("SELECT count(*) FROM attribute_evaluation"),
+                db.count("SELECT count(*) FROM attribute_mode_snapshot"));
+    }
+
+    private String statusOf(Map<String, Object> evaluation) {
+        Object results = evaluation.get("results");
+        if (results instanceof List<?> list && !list.isEmpty()
+                && list.get(0) instanceof Map<?, ?> first) {
+            return String.valueOf(first.get("status"));
+        }
+        return String.valueOf(evaluation.get("status"));
     }
 }

@@ -18,6 +18,7 @@
 | 实体消歧器 | 部件型号 / 实物序列号 / 装配位置 / 设备序列号 / 供应商编码**五类分开建模**；名称相似只产生消歧候选，**绝不自动合并** |
 | 配置快照编译器 | 按指定维修时点重放出厂记录 + 追加式拆装凭证，汇集来源可信度，生成**位置级不可变快照**与重放指纹 |
 | 规则血缘解析器 | 把替代方向、联换条件、协议/尺寸/电源约束连回图号修订、测试报告与生效版本 |
+| 属性断言求值器 | 车间/质检/外协对同一实物的编号、配对、剩余寿命断言按分析日期求值，输出 **确认 / 冲突 / 过期 / 未知**，保留原始编号、制造商前缀、检测方法、报告日期、有效期与配对两侧证据 |
 | 兼容事实求值器 | 对给定快照输出 **通过 / 不通过 / 证据不足** 及**最小证据链** |
 | 影响分析器 | 规则、图号、实装记录变更后定位受影响快照、历史结论与下游数据集 |
 | 发布闸门 | 草稿 / 已验证 / 待复核 / 已废止分通道对外，冲突未裁定或非 PASS 结论禁止发布 |
@@ -25,10 +26,11 @@
 ### 明确不做的事（外部业务系统职责）
 不生成**领料单、维修工序、库存调拨、采购决策、工位排程**。平台只产出可回放的事实与证据。
 
-### 三条关键业务纪律（已在代码中固化）
+### 四条关键业务纪律（已在代码中固化）
 1. **序列号区间重叠**：两张图号都声称对同一序列号生效时，编译器产生冲突事实并冻结快照、阻止兼容发布，**不默认采用最新上传文件**。
 2. **同一实物重叠时间出现在两台设备**：实体消歧器冻结相关实物/位置并要求凭证裁定，**不按接收顺序覆盖**。
 3. **供应商收回替代规则**：影响分析器仅让引用该规则的快照/事实进入待复核；**已签发结论保留当时锁定版本，另发更正事实**，历史报告不改写。
+4. **属性断言冲突**：不同检测方法且不相交的寿命区间**绝不平均**；同一规范号指向两个型号且无改号凭证时**保持主体冲突**；配对证据撤销一侧即**整对不可确认**；超期报告**不能继续支撑确认**，缺口沿属性依赖传播给依赖属性。
 
 ---
 
@@ -49,12 +51,12 @@
 │           ├── config/         # 初始化器、Jackson/PG 序列化
 │           ├── security/       # 令牌认证、角色拦截
 │           ├── repository/     # JdbcSupport
-│           ├── service/        # 七大模块核心逻辑
+│           ├── service/        # 核心模块逻辑（含属性断言求值器）
 │           └── web/            # REST 控制器
 └── frontend/                   # Vue3 工程
     ├── Dockerfile
     ├── nginx.conf
-    └── src/views/              # 10 个业务页面
+    └── src/views/              # 11 个业务页面
 ```
 
 ---
@@ -121,6 +123,7 @@ npm run dev
 | **C 同名异件** | 三个"伺服驱动单元" `PM-SDU-A1`(EtherCAT/380V)、`PM-SDU-B2`(CANopen/220V)、`PM-SDU-C3` | 实体消歧页有 PENDING 候选，仅能人工 `KEEP_DISTINCT`；系统无任何自动合并入口 |
 | **D 规则撤回** | 规则 `SUB-RULE-001`（A1→C3）被撤回 | 已发布事实保留 `rule_version_locked=v1`，另生成 `supersedes` 更正事实；引用快照进入 REVIEW；产生 `RULE_RETIRE`/`FACT_CORRECTION` 事件；历史时点重评仍 PASS 且标注规则已撤回 |
 | **E 两约束联动** | 电源规则 `SUB-RULE-002`(电压380V+尺寸2U) / `SUB-RULE-003`(电压380V+尺寸2U，候选 `PM-PWR-502` 实际尺寸3U) | `500→501` 判 **PASS**；`500→502` 因尺寸约束失败判 **FAIL**；证据链逐项列出两条约束的 expected/actual/passed |
+| **F 属性断言双模式** | `PP-MTR-0001` 编号三写法、ULTRASONIC/VIBRATION 寿命区间、配对撤销 B 侧；`PP-MTR-0018` 超期安装报告与跨型号规范号；`PP-SDU-0001` 改号凭证 | 编号变体归一 **CONFIRMED**（原文全保留）；方法区间不相交 **CONFLICT**（禁止平均）；配对撤销一侧 **不可确认**；超期 **EXPIRED** 且寿命缺口传播为 **UNKNOWN**；跨型号无改号凭证 **主体冲突**；来源优先级模式额外落选择快照 |
 
 附加：实物 `PP-PUMP-0001` 在重叠时间段分别安装于设备 0007/0008，触发 `PHYSICAL_PART_DOUBLE_MOUNT`，
 实物与相关位置被冻结，需在"实体消歧"页做凭证裁定。
@@ -130,7 +133,8 @@ npm run dev
 2. **快照与时点查询**：查看 `SNP-0018`（冲突冻结）、`SNP-0007` 的 v1/v2 版本差异，打开详情看重放指纹与位置事实。
 3. **兼容与发布闸门**：选快照+位置+候选型号求值，展开最小证据链；尝试发布冲突快照上的事实，观察被拦截。
 4. **规则与血缘**：打开 `SUB-RULE-001` 血缘抽屉（图号修订/测试报告/引用事实），点"撤回"观察影响。
-5. **影响分析 / 质量事件 / 实体消歧**：复核待复核清单、更正链与凭证裁定。
+5. **影响分析 / 质量事件 / 实体消歧**：复核待复核清单、更正链与凭证裁定（属性冲突/过期/缺口/配对撤销也登记为质量事件）。
+6. **属性断言求值**：选实物 `PP-MTR-0001`、分析日期 `2024-12-01`，分别用"断言时态/来源优先级"求值；展开行查看来源路径（原始编号、前缀、检测方法、报告日期、有效期）、配对 A/B 证据、方法区间与证据缺口；切换 `PP-MTR-0018` 查看过期与缺口传播；把分析日期改到 `2024-08-01` 观察同一断言结论变化。
 
 ### 主要 REST 接口（均需 `Authorization: Bearer <token>`，登录接口除外）
 ```
@@ -148,6 +152,10 @@ POST /api/compatibility/evaluate | GET /api/compatibility/facts-all
 POST /api/facts/{id}/gate | GET /api/facts/public | GET /api/release/audit-logs
 POST /api/impact/rule/{id} | /api/impact/drawing-revision/{id} | /api/impact/install-event/{id}
 GET  /api/impact | GET /api/quality-events | POST /api/quality-events/{id}/close
+GET  /api/attributes/subjects | /api/attributes/assertions?subjectId=&attributeKey=&includeRevoked=
+POST /api/attributes/assertions | /api/attributes/assertions/{id}/revoke   # 配对可用 side=A|B 单向撤销
+POST /api/attributes/evaluate        # body: subjectId, mode=SOURCE_PRIORITY|TEMPORAL, analysisDate, attributeKey?
+GET  /api/attributes/evaluations | /api/attributes/mode-snapshots | /api/attributes/dependencies
 ```
 
 ---
@@ -158,6 +166,8 @@ GET  /api/impact | GET /api/quality-events | POST /api/quality-events/{id}/close
 - `config_snapshot` / `snapshot_position` **只插入不更新**：每次编译产生新版本号，保存 `source_event_ids`、`source_factory_ids` 与 `replay_digest`（重放指纹）。
 - 兼容性事实带 `rule_version_locked`；规则撤回后原事实不被改写，更正通过新事实 + `supersedes_fact_id` 串联。
 - 所有来源记录保存 `source_ref` + `payload_digest`（文件指纹），契约版本索引长期保留。
+- `attribute_assertion` **只追加**：原始编号 `raw_value` 与归一化 `normalized_value` 分开保存，撤销只改 `status` 与撤销侧，历史原文不删；`pairing_evidence` 按 A/B 两侧独立留痕。
+- `attribute_evaluation` 每次求值留档（模式、分析日期、选中断言、异常、缺口、来源路径）；`attribute_mode_snapshot` 仅在来源优先级模式落库，用于解释"历史为什么选了它"（读取快但需额外快照）。
 
 ---
 
@@ -167,20 +177,26 @@ GET  /api/impact | GET /api/quality-events | POST /api/quality-events/{id}/close
 
 1. `mvn -DskipTests package` 成功，产出 `backend/target/mdm-platform.jar`（Spring Boot 3.5.16 / JDK 25）。
 2. `npm run build` 成功，产出 `frontend/dist`（Vite + Vue3 生产包）。
-3. 后端连接本地 PostgreSQL 18 成功，自动建表、灌种子并重放五大场景：启动日志确认生成 **5 个配置快照、6 条兼容事实、5 条质量事件**，且
+3. 后端连接本地 PostgreSQL 18 成功，自动建表、灌种子并重放五大场景 + 属性断言场景：启动日志确认生成 **5 个配置快照、6 条兼容事实、11 条质量事件、13 条属性求值台账、1 份来源优先级选择快照**，且
    - 场景 A 冲突冻结 + 发布闸门拦截成功；
    - 场景 B v1/v2 版本差异正确（v1 无冷却位证据、v2 纳入迟到凭证后出现冷却泵）；
    - 场景 E 伺服/电源 PASS、502 尺寸 FAIL；
-   - 场景 D 撤回后历史结论保留锁定版本并生成更正链。
+   - 场景 D 撤回后历史结论保留锁定版本并生成更正链；
+   - 属性场景：编号变体 `CONFIRMED`、寿命方法区间不相交 `CONFLICT`、配对撤销 B 侧不可确认、`PP-MTR-0018` 安装日期 `EXPIRED` 且寿命缺口传播 `UNKNOWN`、跨型号无改号凭证 `CONFLICT`、有改号凭证 `CONFIRMED`。
 4. REST 冒烟通过：登录鉴权（错误密码 HTTP 401）、VIEWER 写操作返回 403、版本化时点查询、规则血缘、证据链 jsonb 原生输出、`facts-all`/`facts/public` 数据正确。
-5. 前端 `vite build` 编译无错误，10 个页面与路由、角色按钮禁用均已接线。
-6. 端到端断言脚本 `backend/verify_e2e.py`（仅依赖 Python 标准库，对运行中的服务做 21 项断言）全部通过，可重复执行：
+5. 前端 `vite build` 编译无错误，11 个页面与路由、角色按钮禁用均已接线；`vite` 开发服务器启动后页面模块（含 `Attributes.vue`）可正常加载（本环境无无头浏览器，未做像素级截图验证）。
+6. `mvn test` 通过 **8 项单元测试**（含编号归一：前缀/分隔符剥离、末段数字去前导零、不同编号不误合并）。
+7. 端到端断言脚本 `backend/verify_e2e.py`（仅依赖 Python 标准库，对运行中的服务做 **42 项断言**，含原有五大场景与属性断言 20 项）全部通过，且可重复执行（凭证裁定已闭环时自动识别）：
    ```bash
    # 先启动后端，再运行
    python3 backend/verify_e2e.py
    ```
 
-**未在本环境执行的验证**：当前容器未安装 Docker，故 `docker compose up --build` 的容器化一键启动**未在本环境实跑**；Dockerfile/compose 已按多阶段构建与官方基础镜像编写，需在具备 Docker 的环境执行确认。
+8. 全新库验证：`DROP SCHEMA public CASCADE` 后重启后端，初始化重放日志与上列结论逐项一致（属性求值台账 13 条、选择快照 1 份、质量事件 11 条），说明场景不依赖残留状态。
+
+**未在本环境执行的验证**：
+- 当前容器未安装 Docker，故 `docker compose up --build` 的容器化一键启动**未在本环境实跑**；Dockerfile/compose 已按多阶段构建与官方基础镜像编写，需在具备 Docker 的环境执行确认。
+- 容器内无可用无头浏览器，前端仅做 `vite build` 生产构建与 `vite` 开发服务器模块加载验证，**未做浏览器截图级 UI 验证**。
 
 ---
 
